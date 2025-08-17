@@ -1,394 +1,399 @@
-import socket
+import asyncio
 import ssl
-import time
-import threading
 import base64
+import logging
+import certifi
+import random
+import time
+import traceback
+import socket
 
-# Configuration
-nickname = "turtoise"
-password = "seawater"
-email = "turtoise@gmail.com"
-channel_name = "#echochannel"
+logging.basicConfig(
+    format='[%(asctime)s] %(levelname)s:%(name)s: %(message)s',
+    datefmt='%H:%M:%S',
+    level=logging.DEBUG
+)
 
-irc_networks = {
-    # Common major networks
-    "Libera.Chat":      [("irc.libera.chat", 6697), "SASL", "NickServ"],
-    "OFTC":             [("irc.oftc.net", 6697), "SASL", "NickServ"],
-    "Undernet":         [("irc.undernet.org", 6667), "X"],
-    "EFnet":            [("irc.efnet.org", 6697), "NickServ"],
-    "DALnet":           [("irc.dal.net", 6697), "NickServ"],
-    "Rizon":            [("irc.rizon.net", 6697), "NickServ"],
-    "QuakeNet":         [("irc.quakenet.org", 6667), "Q"],
-    "Snoonet":          [("irc.snoonet.org", 6697), "NickServ"],
+class IRCClient:
+    def __init__(self, net_name, server_info, auth_services, nickname, password, email, channel_name):
+        self.net_name = net_name
+        self.server = server_info[0]
+        self.port = server_info[1]
+        self.auth_services = auth_services
+        self.nickname = nickname
+        self.original_nickname = nickname
+        self.password = password
+        self.email = email
+        self.channel_name = channel_name
+        self.reader = None
+        self.writer = None
+        self.logger = logging.getLogger(f"IRCClient-{self.net_name}")
+        self.authenticated = False
+        self.connected = False
+        self.joined_channel = False
+        self.reconnect_delay = 10
+        self.sasl_supported = False
 
-    # Other well-known networks
-    "FreenodeClassic":  [("irc.freenode.net", 6697), "NickServ"],
-    "IRCNet":           [("irc.ircnet.net", 6667), None],
-    "GameSurge":        [("irc.gamesurge.net", 6667), "AuthServ"],
-    "EsperNet":         [("irc.esper.net", 6697), "NickServ"],
-    "Hackint":          [("irc.hackint.org", 6697), "NickServ"],
-    "GeekShed":         [("irc.geekshed.net", 6697), "NickServ"],
-    "SpigotMC":         [("irc.spi.gt", 6697), "NickServ"],
-    "PIRC":             [("irc.pirc.pl", 6697), "NickServ"],
-    "DarkMyst":         [("irc.darkmyst.org", 6697), "NickServ"],
-    "SlashNET":         [("irc.slashnet.org", 6667), "NickServ"],
-    "DALnet-EU":        [("irc.eu.dal.net", 6697), "NickServ"],
-    "EFnet-US":         [("irc.efnet.org", 6697), "NickServ"],
-
-    # Smaller or niche networks
-    "Rezosup":          [("irc.rezosup.org", 6697), "NickServ"],
-    "TilaaNet":         [("irc.tilaa.net", 6697), "NickServ"],
-    "Xertion":          [("irc.xertion.org", 6697), "NickServ"],
-    "420chan":          [("irc.420chan.org", 6697), "NickServ"],
-
-    # Additional known IRC networks
-    "AnimeNET":         [("irc.animenetwork.org", 6697), "NickServ"],
-    "Blizzard":         [("irc.blizzardirc.net", 6697), "NickServ"],
-    "BattleNet":        [("irc.battle.net", 6667), "NickServ"],
-    "Haskell":          [("irc.haskell.org", 6667), "NickServ"],
-    "Libera":           [("irc.libera.chat", 6667), "SASL", "NickServ"],
-    "MetalIRC":         [("irc.metalirc.org", 6697), "NickServ"],
-    "MozNet":           [("irc.moznet.org", 6667), "NickServ"],
-    "NetRevolution":    [("irc.netrev.net", 6697), "NickServ"],
-    "Netsplit.de":      [("irc.netsplit.de", 6697), "NickServ"],
-    "NordNet":          [("irc.nordnet.org", 6667), None],
-    "Omegaserv":        [("irc.omegaserv.net", 6667), "NickServ"],
-    "PixelZone":        [("irc.pixelzone.net", 6697), "NickServ"],
-    "PTnet":            [("irc.ptnet.org", 6697), "NickServ"],
-    "RizonEU":          [("eu.rizon.net", 6697), "NickServ"],
-    "RubyNet":          [("irc.ruby.net", 6697), "NickServ"],
-    "SWECLAN":          [("irc.sweclan.org", 6697), "NickServ"],
-    "TrekNet":          [("irc.treknet.org", 6667), "NickServ"],
-    "UnderNet-DE":      [("irc.undernet.de", 6667), "X"],
-    "Undernet-UK":      [("irc.undernet.uk", 6667), "X"],
-    "Vortex":           [("irc.vortexirc.net", 6697), "NickServ"],
-    "WeaselNet":        [("irc.weaselnet.org", 6667), "NickServ"],
-    "Wolfnet":          [("irc.wolfnet.net", 6667), "NickServ"],
-    "ZNC":              [("irc.znc.in", 6697), "NickServ"],
-    "ZenithNet":        [("irc.zenithnet.net", 6667), "NickServ"],
-    "Zircon":           [("irc.zircon.net", 6697), "NickServ"],
-
-    # Gaming and niche communities
-    "MinecraftNet":     [("irc.minecraft.net", 6667), "NickServ"],
-    "ZeldaNet":         [("irc.zeldanet.org", 6667), "NickServ"],
-    "TF2Net":           [("irc.tf2net.com", 6697), "NickServ"],
-    "SteamIRC":         [("irc.steamcommunity.com", 6667), None],
-    "WoWNet":           [("irc.wownet.org", 6697), "NickServ"],
-
-    # Regional IRC Networks
-    "ChatNet":          [("irc.chatnet.org", 6667), "NickServ"],
-    "IranIRC":          [("irc.irannetwork.org", 6697), "NickServ"],
-    "AsiaNet":          [("irc.asianet.org", 6667), "NickServ"],
-    "EuroNet":          [("irc.euronet.org", 6697), "NickServ"],
-    "JapanNet":         [("irc.japan.net", 6667), "NickServ"],
-    "KoreaNet":         [("irc.koreanet.org", 6697), "NickServ"],
-    "LatinNet":         [("irc.latinnet.org", 6697), "NickServ"],
-
-    # Other niche and tech communities
-    "PythonNet":        [("irc.python.org", 6667), "NickServ"],
-    "LinuxNet":         [("irc.linux.org", 6667), "NickServ"],
-    "NodeNet":          [("irc.nodenet.org", 6697), "NickServ"],
-    "Rustaceans":       [("irc.rustaceans.org", 6667), "NickServ"],
-}
-
-# Global state for tracking connection status
-connected_status = {}
-connected_status_lock = threading.Lock()
-
-# Failed Auth Dictionary
-failed_auth = {}
-
-def wait_for_identified(irc, timeout=15):
-    """
-    Waits for and checks IRC server messages for a successful or failed
-    authentication. This is a critical step because authentication is asynchronous.
-    """
-    buffer = ""
-    end = time.time() + timeout
-    irc.settimeout(2)
-    while time.time() < end:
+    async def send(self, command, log_level=logging.DEBUG):
+        if not self.writer:
+            self.logger.warning(f"Attempted to send while disconnected: {command}")
+            return
         try:
-            chunk = irc.recv(4096).decode("utf-8", errors="ignore")
-            if not chunk:
-                break
-            buffer += chunk
-            for line in chunk.strip().split("\r\n"):
-                print(f"[IRC] >> {line}")
-                lower_line = line.lower()
-                # Keywords for successful authentication
-                if any(kw in lower_line for kw in ["identified", "logged in", "password accepted", "authentication successful"]):
-                    return True
-                # Keywords for failed authentication
-                if any(kw in lower_line for kw in ["invalid password", "incorrect", "authentication failed", "not recognized"]):
-                    return False
-        except socket.timeout:
-            continue
-        except Exception:
-            break
-    return False
+            self.writer.write(command.encode("utf-8") + b"\r\n")
+            await self.writer.drain()
+            self.logger.log(log_level, f">> {command}")
+        except (ConnectionError, asyncio.CancelledError) as e:
+            self.logger.error(f"Send failed: {e}")
+            await self.disconnect()
 
-def send_auth_command(irc, service, nick, password):
-    """
-    Sends the appropriate authentication command to the IRC service.
-    """
-    print(f"[Auth] Attempting to authenticate with {service}...")
-    if service == "NickServ":
-        irc.sendall(f"PRIVMSG NickServ :IDENTIFY {password}\r\n".encode())
-    elif service == "X":
-        irc.sendall(f"PRIVMSG X@channels.undernet.org :LOGIN {nick} {password}\r\n".encode())
-    elif service == "Q":
-        irc.sendall(f"PRIVMSG Q@CServe.quakenet.org :AUTH {nick} {password}\r\n".encode())
-    elif service == "AuthServ":
-        irc.sendall(f"PRIVMSG AuthServ@services.gamesurge.net :AUTH {nick} {password}\r\n".encode())
-    else:
-        print(f"[Auth] No known authentication method for service: {service}")
+    async def read_line_with_timeout(self, timeout=15):
+        try:
+            line_bytes = await asyncio.wait_for(self.reader.readline(), timeout=timeout)
+            if not line_bytes:
+                self.logger.warning("Connection closed by server.")
+                return None
+            return line_bytes.decode("utf-8", errors="ignore").strip()
+        except asyncio.TimeoutError:
+            self.logger.warning("⏱ Timeout waiting for server line.")
+            return None
 
-def send_register_command(irc, service, nick, password, email):
-    """
-    Sends the appropriate registration command to the IRC service.
-    """
-    print(f"[Auth] Attempting to register with {service}...")
-    if service == "NickServ":
-        irc.sendall(f"PRIVMSG NickServ :REGISTER {password} {email}\r\n".encode())
-    elif service == "Q":
-        irc.sendall(f"PRIVMSG Q@CServe.quakenet.org :REGISTER {email} {password}\r\n".encode())
-    elif service == "X":
-        irc.sendall(f"PRIVMSG X@channels.undernet.org :REGISTER {password} {email}\r\n".encode())
-    elif service == "AuthServ":
-        irc.sendall(f"PRIVMSG AuthServ@services.gamesurge.net :REGISTER {password} {email}\r\n".encode())
-    else:
-        print(f"[{service}] Does not support a known REGISTER command.")
-
-def handle_sasl_auth(irc, nick, password):
-    """
-    Handles SASL PLAIN authentication before the 001 welcome message.
-    """
-    try:
-        # Request SASL capability
-        irc.sendall("CAP REQ :sasl\r\n".encode())
-        print("[SASL] << CAP REQ :sasl")
-
-        # Wait for the server to acknowledge the capability
-        buffer = ""
-        sasl_ack = False
-        start_time = time.time()
-        while time.time() - start_time < 5:
-            data = irc.recv(4096).decode("utf-8", errors="ignore")
-            buffer += data
-            for line in data.strip().split("\r\n"):
-                print(f"[SASL] >> {line}")
-                if "ACK" in line and "sasl" in line:
-                    sasl_ack = True
-                    break
-            if sasl_ack:
-                break
-        
-        if not sasl_ack:
-            print("[SASL] ❌ Server did not acknowledge SASL. Continuing without it.")
-            return False
-
-        # Send authentication credentials
-        auth_string = base64.b64encode(f"\x00{nick}\x00{password}".encode()).decode()
-        irc.sendall(f"AUTHENTICATE PLAIN\r\n".encode())
-        print("[SASL] << AUTHENTICATE PLAIN")
-
-        # Wait for '+' from server
-        data = irc.recv(1024).decode("utf-8", errors="ignore")
-        print(f"[SASL] >> {data.strip()}")
-        if "+" in data:
-            irc.sendall(f"AUTHENTICATE {auth_string}\r\n".encode())
-            print("[SASL] << AUTHENTICATE <base64_string>")
-            
-            # Wait for SASL success or failure
-            sasl_result = ""
-            start_time = time.time()
-            while time.time() - start_time < 5:
-                data = irc.recv(4096).decode("utf-8", errors="ignore")
-                sasl_result += data
-                if "904" in sasl_result: # SASL authentication failed
-                    print("[SASL] ❌ SASL authentication failed.")
-                    return False
-                elif "903" in sasl_result: # SASL authentication successful
-                    print("[SASL] ✅ SASL authentication successful.")
-                    return True
-        else:
-            print("[SASL] ❌ Server did not send '+'.")
-            return False
-
-    except Exception as e:
-        print(f"[SASL] ❌ SASL Error: {e}")
+    async def connect(self):
+        self.logger.info(f"Connecting to {self.server}:{self.port}...")
+        try:
+            if self.port == 6697:
+                context = ssl.create_default_context(cafile=certifi.where())
+                self.reader, self.writer = await asyncio.open_connection(self.server, self.port, ssl=context)
+            else:
+                self.reader, self.writer = await asyncio.open_connection(self.server, self.port)
+            self.connected = True
+            self.logger.info("Connection successful.")
+            return True
+        except ssl.SSLCertVerificationError as e:
+            self.logger.error(f"❌ SSL Certificate error: {e}")
+        except ConnectionError as e:
+            self.logger.error(f"❌ Connection failed: {e}")
+        except socket.gaierror as e:
+            self.logger.error(f"❌ DNS lookup failed: {self.server}. Error: {e}")
+        self.connected = False
         return False
-    finally:
-        # End capability negotiation
-        irc.sendall("CAP END\r\n".encode())
-        print("[SASL] << CAP END")
-    return False
 
-def irc_thread(net_name, server, port, auth_services):
-    print(f"\n--- Connecting to {net_name} ---")
-    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw_sock.settimeout(15)
-
-    try:
-        if port == 6697:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            irc = context.wrap_socket(raw_sock, server_hostname=server)
-        else:
-            irc = raw_sock
-
-        irc.connect((server, port))
-        irc.settimeout(5)
-
-        authenticated = False
-
-        if "SASL" in auth_services:
-            if handle_sasl_auth(irc, nickname, password):
-                authenticated = True
-
-        irc.sendall(f"NICK {nickname}\r\n".encode())
-        irc.sendall(f"USER {nickname} 0 * :{nickname}\r\n".encode())
-
-        registered = False
-        buffer = ""
-
-        while True:
+    async def disconnect(self):
+        if self.writer:
             try:
-                data = irc.recv(4096).decode("utf-8", errors="ignore")
-                if not data:
-                    print(f"[{net_name}] Connection closed by server.")
-                    break
-                buffer += data
-                lines = buffer.split("\r\n")
-                buffer = lines.pop()
+                await self.send("QUIT :Leaving", logging.INFO)
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
+        self.connected = False
+        self.authenticated = False
+        self.joined_channel = False
+        self.logger.info("Disconnected.")
 
-                for line in lines:
-                    print(f"[{net_name}] >> {line}")
+    def generate_unique_nickname(self):
+        suffix = random.randint(100, 999)
+        self.nickname = f"{self.original_nickname}_{suffix}"
+        self.logger.info(f"Nickname in use, trying new: {self.nickname}")
+
+    async def handle_authentication(self):
+        try:
+            # Initial CAP LS request with longer timeout
+            await self.send("CAP LS 302")
+
+            sasl_supported = False
+            cap_ls_timeout = 30
+            start_time = time.time()
+
+            while True:
+                remaining = cap_ls_timeout - (time.time() - start_time)
+                if remaining <= 0:
+                    self.logger.warning("Timeout waiting for CAP LS response.")
+                    break
+
+                line = await self.read_line_with_timeout(timeout=remaining)
+                if not line:
+                    continue
+                self.logger.debug(f"<< {line}")
+
+                if "CAP" in line and "LS" in line:
+                    parts = line.split(":", 2)
+                    if len(parts) > 2:
+                        cap_str = parts[-1].lower()
+                        if "sasl" in cap_str:
+                            sasl_supported = True
+                            self.logger.info("Server supports SASL (from CAP LS).")
+                    break
+
+            self.sasl_supported = sasl_supported
+
+            if sasl_supported:
+                await self.send("CAP REQ :sasl")
+                # Wait for ACK/NAK for SASL request
+                while True:
+                    line = await self.read_line_with_timeout(timeout=10)
+                    if not line:
+                        continue
+                    self.logger.debug(f"<< {line}")
+                    if "CAP" in line and "ACK" in line and "sasl" in line.lower():
+                        self.sasl_supported = True
+                        self.logger.info("SASL capability acknowledged by server.")
+                        await self.send("AUTHENTICATE PLAIN")
+                        break
+                    if "CAP" in line and "NAK" in line and "sasl" in line.lower():
+                        self.logger.warning("SASL not supported by this server.")
+                        self.sasl_supported = False
+                        break
+
+            await self.send(f"NICK {self.nickname}")
+            await self.send(f"USER {self.nickname} 0 * :{self.nickname}")
+
+            # Registration/authentication loop
+            start_time = time.time()
+            timeout = 30
+
+            while True:
+                remaining = timeout - (time.time() - start_time)
+                if remaining <= 0:
+                    self.logger.error("Timeout during registration/auth.")
+                    return False
+
+                line = await self.read_line_with_timeout(timeout=remaining)
+                if not line:
+                    continue
+
+                self.logger.debug(f"<< {line}")
+                start_time = time.time()  # Reset timeout on any activity
+
+                # Handle late CAP LS line (catch SASL support if missed)
+                if "CAP" in line and "LS" in line:
+                    parts = line.split(":", 2)
+                    if len(parts) > 2:
+                        cap_str = parts[-1].lower()
+                        if "sasl" in cap_str and not self.sasl_supported:
+                            self.logger.info("Detected SASL support late during registration. Requesting SASL now.")
+                            await self.send("CAP REQ :sasl")
+                            self.sasl_supported = True
+                    continue
+
+                if line.startswith("PING"):
+                    await self.send(f"PONG :{line.split(':', 1)[1]}")
+                    continue
+
+                if " 433 " in line:
+                    self.logger.warning(f"Nickname '{self.nickname}' in use.")
+                    self.generate_unique_nickname()
+                    await self.send(f"NICK {self.nickname}")
+                    continue
+
+                if "AUTHENTICATE +" in line and self.sasl_supported:
+                    auth_str = base64.b64encode(f"\0{self.nickname}\0{self.password}".encode()).decode()
+                    self.logger.info("Sending SASL AUTHENTICATE payload.")
+                    await self.send(f"AUTHENTICATE {auth_str}")
+                    continue
+
+                if "903" in line:
+                    self.logger.info("✅ SASL authentication successful.")
+                    await self.send("CAP END")
+                    self.authenticated = True
+                    return True
+
+                if "904" in line or "905" in line:
+                    self.logger.warning("❌ SASL authentication failed.")
+                    break
+
+                if " 001 " in line:
+                    self.logger.info("✅ Registered (001 welcome).")
+                    break
+
+            # Fallback: try NickServ/X/Q identify (rest of your logic unchanged)
+            if self.auth_services:
+                service = self.auth_services[-1].lower()
+
+                identify_cmd = None
+                register_cmd = None
+                if service == "nickserv":
+                    identify_cmd = f"PRIVMSG NickServ :IDENTIFY {self.password}"
+                    register_cmd = f"PRIVMSG NickServ :REGISTER {self.password} {self.email}"
+                elif service == "x":
+                    identify_cmd = f"PRIVMSG X@channels.undernet.org :LOGIN {self.nickname} {self.password}"
+                    register_cmd = f"PRIVMSG X@channels.undernet.org :REGISTER {self.password} {self.email}"
+                elif service == "q":
+                    identify_cmd = f"PRIVMSG Q@CServe.quakenet.org :AUTH {self.nickname} {self.password}"
+                    register_cmd = f"PRIVMSG Q@CServe.quakenet.org :REGISTER {self.email} {self.password}"
+                else:
+                    self.logger.warning(f"Unsupported auth service: {service}")
+                    return False
+
+                await self.send(identify_cmd, logging.INFO)
+                await asyncio.sleep(5)
+
+                auth_success = False
+                line = await self.read_line_with_timeout(timeout=10)
+
+                while not line:
+                    line = await self.read_line_with_timeout(timeout=10)
+                    if not line:
+                        continue
+                    self.logger.debug(f"<< {line}")
+                    if any(word in line.lower() for word in ["identified", "logged in", "accepted", "successfully"]):
+                        auth_success = True
+                        break
+                    if any(kw in line.lower() for kw in ["invalid password", "incorrect", "authentication failed", "not recognized"]):
+                        break
+
+                if auth_success:
+                    self.logger.info("✅ IDENTIFY succeeded.")
+                    await self.send("CAP END")
+                    self.authenticated = True
+                    return True
+
+                self.logger.warning("❌ IDENTIFY failed. Trying REGISTER...")
+
+                await self.send(register_cmd, logging.INFO)
+                await asyncio.sleep(10)
+
+                self.logger.info("🔁 Retrying IDENTIFY after REGISTER...")
+                await self.send(identify_cmd, logging.INFO)
+                await asyncio.sleep(5)
+
+                for _ in range(5):
+                    line = await self.read_line_with_timeout(timeout=10)
+                    if not line:
+                        continue
+                    self.logger.debug(f"<< {line}")
+                    if any(word in line.lower() for word in ["identified", "logged in", "accepted", "successfully"]):
+                        self.logger.info("✅ IDENTIFY successful after REGISTER.")
+                        await self.send("CAP END")
+                        self.authenticated = True
+                        return True
+
+                self.logger.error("❌ REGISTER + IDENTIFY failed.")
+                return False
+
+            await self.send("CAP END")
+            self.authenticated = True
+            return True
+
+        except Exception:
+            self.logger.error("Exception during authentication:")
+            self.logger.error(traceback.format_exc())
+            return False
+
+
+    async def run(self):
+        while True:
+            self.connected = False
+            self.authenticated = False
+            self.joined_channel = False
+
+            if not await self.connect():
+                self.logger.error(f"Connection failed. Retrying in {self.reconnect_delay}s.")
+                await asyncio.sleep(self.reconnect_delay)
+                self.reconnect_delay = min(self.reconnect_delay * 2, 300)
+                continue
+
+            self.reconnect_delay = 10
+
+            if not await self.handle_authentication():
+                self.logger.warning("Failed to authenticate. Disconnecting.")
+                await self.disconnect()
+                await asyncio.sleep(self.reconnect_delay)
+                continue
+
+            await self.send(f"JOIN {self.channel_name}")
+            self.joined_channel = True
+
+            try:
+                while self.connected:
+                    line = await self.read_line_with_timeout(timeout=60)
+                    if not line:
+                        continue
+
+                    self.logger.debug(f"<< {line}")
 
                     if line.startswith("PING"):
-                        parts = line.split(":", 1)
-                        if len(parts) == 2:
-                            irc.sendall(f"PONG :{parts[1].strip()}\r\n".encode())
-                            print(f"[{net_name}] << PONG :{parts[1].strip()}")
+                        await self.send(f"PONG :{line.split(':', 1)[1]}")
 
-                    if " 433 " in line and nickname in line:
-                        print(f"[{net_name}] ❌ Nickname '{nickname}' already in use on server.")
-                        with connected_status_lock:
-                            connected_status.pop(net_name, None)
-                            failed_auth[net_name] = "Nickname already in use"
-                        irc.sendall(f"QUIT :Nickname already in use\r\n".encode())
-                        irc.close()
-                        return
+                    elif f"JOIN :{self.channel_name}".lower() in line.lower() and self.nickname.lower() in line.lower():
+                        self.logger.info(f"Joined channel {self.channel_name}")
 
-                    if " 001 " in line and not registered:
-                        print(f"[{net_name}] ✅ Connected to IRC network.")
-                        registered = True
-
-                        if not authenticated and len(auth_services) > 1 and auth_services[1]:
-                            post_auth_service = auth_services[1]
-
-                            # 1. Try IDENTIFY
-                            send_auth_command(irc, post_auth_service, nickname, password)
-                            if wait_for_identified(irc):
-                                print(f"[{net_name}] ✅ Successfully authenticated with {post_auth_service}.")
-                                authenticated = True
-                            else:
-                                print(f"[{net_name}] ❌ Authentication failed with {post_auth_service}. Trying to REGISTER...")
-                                
-                                # 2. Try REGISTER
-                                send_register_command(irc, post_auth_service, nickname, password, email)
-                                time.sleep(10)  # Some networks need more time to process registration
-
-                                # 3. Try IDENTIFY again
-                                send_auth_command(irc, post_auth_service, nickname, password)
-                                if wait_for_identified(irc):
-                                    print(f"[{net_name}] ✅ Authenticated after registration.")
-                                    authenticated = True
-                                else:
-                                    print(f"[{net_name}] ❌ Still unauthenticated after REGISTER. Closing connection.")
-                                    irc.sendall("QUIT :Authentication failed\r\n".encode())
-                                    irc.close()
-                                    with connected_status_lock:
-                                        connected_status.pop(net_name, None)
-                                        failed_auth[net_name] = "Authentication failed or nick in use"
-                                    return
-
-                        with connected_status_lock:
-                            connected_status[net_name] = authenticated
-
-                        if authenticated or not auth_services:
-                            irc.sendall(f"JOIN {channel_name}\r\n".encode())
-                        else:
-                            print(f"[{net_name}] ❌ Failed to authenticate. Closing connection.")
-                            irc.sendall("QUIT :Authentication required but failed\r\n".encode())
-                            irc.close()
-                            with connected_status_lock:
-                                connected_status.pop(net_name, None)
-                            return
-
-                    if f"JOIN :{channel_name}" in line and nickname.lower() in line.lower():
-                        print(f"[{net_name}] ✅ Joined channel {channel_name}")
-
-                    if f"PRIVMSG {nickname}" in line:
+                    elif f"PRIVMSG {self.nickname}" in line:
                         prefix = line.split(" ")[0]
-                        if "!" in prefix:
-                            sender_nick = prefix[1:].split("!")[0]
-                            irc.sendall(f"PRIVMSG {sender_nick} :echo\r\n".encode())
-                            print(f"[{net_name}] Sent 'echo' to {sender_nick}")
+                        sender_nick = prefix[1:].split("!")[0]
+                        msg = line.split(":", 2)[2].strip()
 
-            except socket.timeout:
-                continue
+                        if msg.startswith("\x01") and msg.endswith("\x01"):
+                            ctcp_command = msg[1:-1].upper()
+                            self.logger.info(f"📡 Received CTCP {ctcp_command} from {sender_nick}")
+                            if ctcp_command == "VERSION":
+                                await self.send(f"NOTICE {sender_nick} :\x01VERSION TurboBot 1.0 (Python)\x01")
+                        elif msg.upper() == "VERSION":
+                            self.logger.info(f"📡 Received plain VERSION request from {sender_nick}")
+                            await self.send(f"PRIVMSG {sender_nick} :VERSION TurboBot 1.0 (Python)")
+                        else:
+                            await self.send(f"PRIVMSG {sender_nick} :echo")
+
+            except (asyncio.TimeoutError, ConnectionError) as e:
+                self.logger.error(f"Network error: {e}")
+                await self.disconnect()
             except Exception as e:
-                print(f"[{net_name}] ❌ Error: {e}")
-                break
+                self.logger.error(f"Unexpected error: {e}")
+                await self.disconnect()
 
-    except Exception as e:
-        print(f"[{net_name}] ❌ Connection error: {e}")
-    finally:
-        try:
-            irc.close()
-        except Exception:
-            pass
-        with connected_status_lock:
-            connected_status.pop(net_name, None)
-        print(f"[{net_name}] Disconnected.")
-
-
-def report_status_loop():
-    """Reports the status of connected and authenticated servers every 60 seconds."""
+async def status_reporter(clients, interval):
+    """Periodically reports the status of all IRC clients."""
     while True:
-        time.sleep(60)
-        with connected_status_lock:
-            authenticated_servers = {
-                net: auth for net, auth in connected_status.items() if auth
-            }
-            if authenticated_servers:
-                print("\n=== Live & Authenticated Servers Report ===")
-                for net in authenticated_servers:
-                    print(f" - {net}: Authenticated")
-                print("============================================\n")
-            else:
-                print("\n=== No servers currently authenticated ===\n")
+        await asyncio.sleep(interval)
+        print("\n" + "="*65)
+        print("📈 IRC Server Status Report")
+        print("="*65)
+        for client in clients:
+            status = "✅ Connected" if client.connected else "❌ Disconnected"
+            auth_status = "✅ Authenticated" if client.authenticated else "❌ Not Authenticated"
+            print(f"| {client.net_name:<15} | {status:<18} | {auth_status:<20} |")
+        print("="*65 + "\n")
 
-            if failed_auth:
-                print("\n=== Nickname-In-Use Networks ===")
-                for net, reason in failed_auth.items():
-                    print(f" - {net}: {reason}")
-                print("============================================\n")
+async def main():
+    nickname = "turtoise"
+    password = "seawater"
+    email = "turtoise@gmail.com"
+    channel_name = "#echochannel"
 
-def main():
-    """Main function to start threads for all IRC networks."""
-    threads = []
+    irc_networks = {
+        "Libera.Chat":      [("irc.libera.chat", 6697), "SASL", "NickServ"],
+        "OFTC":             [("irc.oftc.net", 6697), "SASL", "NickServ"],
+        "Undernet":         [("irc.undernet.org", 6697), "X"],
+        "QuakeNet":         [("irc.quakenet.org", 6697), "Q"],
+        "EFnet":            [("irc.efnet.org", 6697), "SASL", "NickServ"],
+        "DALnet":           [("irc.dal.net", 6697), "SASL", "NickServ"],
+        "EsperNet":         [("irc.esper.net", 6697), "SASL", "NickServ"],
+        "GeekShed":         [("irc.geekshed.net", 6697), "SASL", "NickServ"],
+    }
+
+    clients = []
+    tasks = []
+
     for net_name, (server_info, *auth_services) in irc_networks.items():
-        t = threading.Thread(target=irc_thread, args=(net_name, server_info[0], server_info[1], auth_services), daemon=True)
-        t.start()
-        threads.append(t)
+        client = IRCClient(net_name, server_info, auth_services, nickname, password, email, channel_name)
+        clients.append(client)
+        tasks.append(asyncio.create_task(client.run()))
+
+    # Add the status reporter task
+    tasks.append(asyncio.create_task(status_reporter(clients, 90)))
 
     try:
-        report_status_loop()
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        pass  # Expected when a task is cancelled
     except KeyboardInterrupt:
-        print("Exiting...")
+        print("Keyboard interrupt received. Exiting gracefully...")
+        # Cancel all tasks and wait for them to finish their cleanup
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Program shut down.")
