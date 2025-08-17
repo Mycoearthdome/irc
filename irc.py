@@ -142,6 +142,10 @@ class IRCClient:
                         if target.startswith("#"):
                             reply = f"PRIVMSG {target} :You said: {message}"
                             await self.send(reply, logging.DEBUG)
+                        elif target == self.nickname:
+                            # Private message sent to the bot
+                            reply = f"PRIVMSG {sender} :You PM'd me: {message}"
+                            await self.send(reply, logging.DEBUG)
         except Exception as e:
             self.logger.error(f"💥 Exception in message loop: {e}")
             self.connected = False
@@ -410,9 +414,9 @@ async def shutdown(clients, tasks):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 async def main():
-    nickname = "doggybag2025"
-    password = "takeout"
-    email = "doggybag2025@gmail.com"
+    nickname = "user_"
+    password = "pass"
+    email = "user@example.com"
     channel_name = "#echochannel"
 
     irc_networks = {
