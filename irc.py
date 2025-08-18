@@ -7,6 +7,10 @@ import random
 import time
 import traceback
 import socket
+import os
+import struct
+import shlex
+import requests
 
 logging.basicConfig(
     format='[%(asctime)s] %(levelname)s:%(name)s: %(message)s',
@@ -14,8 +18,14 @@ logging.basicConfig(
     level=logging.DEBUG
 )
 
+DCC_STATE = {
+    "resumes": {},  # filename -> {"resume_pos": int, "nick": str}
+    "accepts": {},  # filename -> {"port": int, "pos": int, "nick": str}
+}
+DCC_STATE_LOCK = asyncio.Lock()
+
 class IRCClient:
-    def __init__(self, net_name, server_info, auth_services, nickname, password, email, channel_name):
+    def __init__(self, net_name, server_info, auth_services, nickname, password, email, channel_name, dcc_send_filename):
         self.net_name = net_name
         self.server = server_info[0]
         self.port = server_info[1]
@@ -40,6 +50,8 @@ class IRCClient:
         self.joined_channel = False
         self.reconnect_delay = 10
         self.sasl_supported = False
+        self.pending_dcc = {}
+        self.dcc_send_filename = dcc_send_filename
 
     async def send(self, command, log_level=logging.DEBUG):
         if not self.writer:
@@ -121,34 +133,114 @@ class IRCClient:
 
                 self.logger.debug(f"<< {line}")
 
-                # Respond to server PINGs to stay connected
+                # Respond to server PINGs
                 if line.startswith("PING"):
                     pong_response = line.replace("PING", "PONG", 1)
                     await self.send(pong_response, logging.DEBUG)
                     continue
 
-                # Handle a PRIVMSG (someone sending a message to a channel or PM to the bot)
+                # Extract sender (nick)
+                sender = None
+                if line.startswith(":") and "!" in line:
+                    sender = line.split("!", 1)[0][1:]
+
+                # Only proceed with PRIVMSG
                 if "PRIVMSG" in line:
-                    prefix, trailing = line.split(" :", 1)
-                    parts = prefix.split()
-                    if len(parts) >= 3:
-                        sender = parts[0][1:].split('!')[0]
-                        target = parts[2]  # could be a channel or our nick
-                        message = trailing
+                    try:
+                        prefix, trailing = line.split(" :", 1)
+                        parts = prefix.split()
+                        if len(parts) >= 3:
+                            sender = parts[0][1:].split('!')[0]
+                            target = parts[2]
+                            message = trailing
 
-                        self.logger.info(f"[{target}] <{sender}> {message}")
+                            self.logger.info(f"[{target}] <{sender}> {message}")
 
-                        # Simple echo bot: reply back if the message is in a channel
-                        if target.startswith("#"):
-                            reply = f"PRIVMSG {target} :You said: {message}"
-                            await self.send(reply, logging.DEBUG)
-                        elif target == self.nickname:
-                            # Private message sent to the bot
-                            reply = f"PRIVMSG {sender} :You PM'd me: {message}"
-                            await self.send(reply, logging.DEBUG)
+                            # Simple echo bot
+                            if target.startswith("#"):
+                                reply = f"PRIVMSG {target} :You said: {message}"
+                                await self.send(reply, logging.DEBUG)
+                            elif target == self.nickname:
+                                reply = f"PRIVMSG {sender} :You PM'd me: {message}"
+                                await self.send(reply, logging.DEBUG)
+
+                                if not os.path.exists(self.dcc_send_filename):
+                                        self.logger.warning(f"DCC file '{self.dcc_send_filename}' does not exist.")
+                                else:
+                                    await dcc_send_with_resume(sender, self.dcc_send_filename, self.send, port=random.randint(5000, 6000))
+
+                            # Handle CTCP messages
+                            if message.startswith('\x01DCC SEND'):
+                                try:
+                                    ctcp_data = message.strip('\x01')
+                                    parts = shlex.split(ctcp_data)
+                                    _, _, file_name, ip_str, port_str, size_str = parts
+
+                                    ip_int = int(ip_str)
+                                    port = int(port_str)
+                                    file_size = int(size_str)
+
+                                    self.logger.info(f"[DCC] Incoming file '{file_name}' from {sender}. Accepting...")
+
+                                    self.pending_dcc[file_name] = {
+                                        "ip_int": ip_int,
+                                        "port": port,
+                                        "file_size": file_size,
+                                        "nick": sender
+                                    }
+
+                                    await dcc_receive_with_resume(
+                                        sender,
+                                        file_name,
+                                        ip_int,
+                                        port,
+                                        file_size,
+                                        self.send,
+                                        save_path=file_name
+                                    )
+
+                                except Exception as e:
+                                    self.logger.error(f"[DCC] Failed to parse DCC SEND: {message} | Error: {e}")
+
+                            elif message.startswith('\x01DCC RESUME'):
+                                try:
+                                    ctcp_data = message.strip('\x01')
+                                    parts = shlex.split(ctcp_data)
+                                    _, _, file_name, port_str, pos_str = parts
+                                    async with DCC_STATE_LOCK:
+                                        DCC_STATE.setdefault("resumes", {})[file_name] = {
+                                            "resume_pos": int(pos_str),
+                                            "nick": sender
+                                        }
+
+                                    # Send ACCEPT
+                                    accept_msg = f'\x01DCC ACCEPT "{file_name}" {port_str} {pos_str}\x01'
+                                    await self.send(f"PRIVMSG {sender} :{accept_msg}")
+                                    self.logger.info(f"[DCC] RESUME from {sender} for {file_name} at {pos_str}, sent ACCEPT.")
+                                except Exception as e:
+                                    self.logger.error(f"[DCC] Error parsing RESUME: {message} | {e}")
+
+                            elif message.startswith('\x01DCC ACCEPT'):
+                                try:
+                                    ctcp_data = message.strip('\x01')
+                                    parts = shlex.split(ctcp_data)
+                                    _, _, file_name, port_str, pos_str = parts
+                                    async with DCC_STATE_LOCK:
+                                        DCC_STATE.setdefault("accepts", {})[file_name] = {
+                                            "port": int(port_str),
+                                            "pos": int(pos_str),
+                                            "nick": sender
+                                        }
+                                    self.logger.info(f"[DCC] ACCEPT received from {sender} for {file_name}")
+                                except Exception as e:
+                                    self.logger.error(f"[DCC] Error parsing ACCEPT: {message} | {e}")
+                    except Exception as e:
+                        self.logger.error(f"[PRIVMSG Handling Error] {e}")
+
         except Exception as e:
             self.logger.error(f"💥 Exception in message loop: {e}")
             self.connected = False
+
 
     async def is_nickname_registered(self):
         # Send INFO command and parse replies to detect if nick is registered and verified
@@ -413,11 +505,120 @@ async def shutdown(clients, tasks):
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
 
+
+def ip_to_int(ip):
+    return struct.unpack("!I", socket.inet_aton(ip))[0]
+
+
+def int_to_ip(ip_int):
+    return socket.inet_ntoa(struct.pack("!I", ip_int))
+
+
+async def dcc_receive_with_resume(nick, file_name, ip_int, port, file_size, send_func, save_path=None):
+    ip = int_to_ip(ip_int)
+    save_path = save_path or file_name
+    resume_position = 0
+
+    if os.path.exists(save_path):
+        resume_position = os.path.getsize(save_path)
+        if resume_position >= file_size:
+            print(f"[DCC] {file_name} already downloaded.")
+            return
+
+        # Send RESUME
+        resume_msg = f'\x01DCC RESUME "{file_name}" {port} {resume_position}\x01'
+        await send_func(f"PRIVMSG {nick} :{resume_msg}")
+        print(f"[DCC] Sent RESUME {resume_position} to {nick}")
+
+        # Wait for ACCEPT
+        for _ in range(10):
+            await asyncio.sleep(1)
+            async with DCC_STATE_LOCK:
+                if file_name in DCC_STATE["accepts"]:
+                    DCC_STATE["accepts"].pop(file_name, None)
+                    break
+        else:
+            resume_position = 0  # No ACCEPT, start from zero
+
+    reader, writer = await asyncio.open_connection(ip, port)
+    mode = 'ab' if resume_position else 'wb'
+    total = resume_position
+
+    with open(save_path, mode) as f:
+        while total < file_size:
+            chunk = await reader.read(1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            total += len(chunk)
+
+    writer.close()
+    await writer.wait_closed()
+    print(f"[DCC] Received {file_name} to {save_path}")
+
+
+
+async def dcc_send_with_resume(nick, file_path, send_func, bind_ip='0.0.0.0', port=5001):
+    file_name = os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+    public_ip = requests.get("https://api.ipify.org").text
+    ip_int = ip_to_int(public_ip)
+
+    resume_position = 0
+    resume_event = asyncio.Event()
+
+    async def wait_for_resume_accept():
+        nonlocal resume_position
+        for _ in range(10):
+            await asyncio.sleep(1)
+            async with DCC_STATE_LOCK:
+                resume_info = DCC_STATE['resumes'].get(file_name)
+                if resume_info and resume_info["nick"] == nick:
+                    resume_position = resume_info["resume_pos"]
+                    DCC_STATE['resumes'].pop(file_name, None)
+                    resume_event.set()
+                    break
+
+    async def file_server(reader, writer):
+        with open(file_path, 'rb') as f:
+            if resume_position:
+                f.seek(resume_position)
+            while chunk := f.read(1024):
+                writer.write(chunk)
+                await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    # Send DCC SEND
+    dcc_message = f'\x01DCC SEND "{file_name}" {ip_int} {port} {file_size}\x01'
+    await send_func(f"PRIVMSG {nick} :{dcc_message}", logging.DEBUG)
+
+    await wait_for_resume_accept()
+
+    try:
+        server = await asyncio.start_server(file_server, bind_ip, port)
+        async with server:
+            await asyncio.wait_for(server.serve_forever(), timeout=60)
+    except asyncio.TimeoutError:
+        print(f"[DCC] Timeout: {nick} did not connect to receive {file_name}.")
+
+
+
+
+
+
+
+
+
+
+
+
 async def main():
     nickname = "user_"
     password = "pass"
     email = "user@example.com"
     channel_name = "#echochannel"
+    dcc_send_filename = "irc.py"
 
     irc_networks = {
         # Common major networks
@@ -450,7 +651,7 @@ async def main():
 
     # Add the status reporter task
     for net_name, (server_info, *auth_services) in irc_networks.items():
-        client = IRCClient(net_name, server_info, auth_services, nickname, password, email, channel_name)
+        client = IRCClient(net_name, server_info, auth_services, nickname, password, email, channel_name, dcc_send_filename)
         clients.append(client)
         tasks.append(asyncio.create_task(run_client_with_error_handling(client)))
 
