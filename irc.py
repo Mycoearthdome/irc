@@ -566,6 +566,7 @@ async def dcc_send_with_resume(nick, file_path, send_func, bind_ip='0.0.0.0', po
 
     resume_position = 0
     resume_event = asyncio.Event()
+    transfer_complete = asyncio.Event()
 
     async def wait_for_resume_accept():
         nonlocal resume_position
@@ -580,14 +581,24 @@ async def dcc_send_with_resume(nick, file_path, send_func, bind_ip='0.0.0.0', po
                     break
 
     async def file_server(reader, writer):
-        with open(file_path, 'rb') as f:
-            if resume_position:
-                f.seek(resume_position)
-            while chunk := f.read(1024):
-                writer.write(chunk)
-                await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        try:
+            with open(file_path, 'rb') as f:
+                if resume_position:
+                    f.seek(resume_position)
+
+                sent_bytes = resume_position
+                while chunk := f.read(1024):
+                    writer.write(chunk)
+                    await writer.drain()
+                    sent_bytes += len(chunk)
+
+            print(f"[DCC] ✅ Sent {file_name} to {nick} ({sent_bytes}/{file_size} bytes)")
+        except Exception as e:
+            print(f"[DCC] ❌ Error during file send: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            transfer_complete.set()  # Signal that transfer is done
 
     # Send DCC SEND
     dcc_message = f'\x01DCC SEND "{file_name}" {ip_int} {port} {file_size}\x01'
@@ -598,9 +609,16 @@ async def dcc_send_with_resume(nick, file_path, send_func, bind_ip='0.0.0.0', po
     try:
         server = await asyncio.start_server(file_server, bind_ip, port)
         async with server:
-            await asyncio.wait_for(server.serve_forever(), timeout=60)
-    except asyncio.TimeoutError:
-        print(f"[DCC] Timeout: {nick} did not connect to receive {file_name}.")
+            print(f"[DCC] 📡 Waiting for {nick} to connect...")
+            try:
+                print(f"[DCC] ⏳ Waiting up to 90s for {nick} to complete transfer of '{file_name}'...")
+                await asyncio.wait_for(transfer_complete.wait(), timeout=90)
+                print(f"[DCC] ✅ Transfer of '{file_name}' completed.")
+            except asyncio.TimeoutError:
+                print(f"[DCC] ⚠️ Timeout: {nick} did not complete transfer of '{file_name}' within 90s.")
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 
